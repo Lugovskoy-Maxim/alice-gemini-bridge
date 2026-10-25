@@ -1,0 +1,14 @@
+.DS_Store
+.npm-cache/
+.wrangler-logs/
+**/node_modules/
+cloudflare-worker/.wrangler/
+cloudflare-worker/.dev.vars
+cloudflare-worker/.dev.vars.*
+data/
+outputs/
+*.log
+*.zip
+*.dmg
+*.app/
+!cloudflare-worker/.dev.vars.example

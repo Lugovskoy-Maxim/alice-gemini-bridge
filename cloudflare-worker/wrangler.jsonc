@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "alice-gemini-bridge",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-25",
+  "workers_dev": true,
+  "vars": {
+    "UPSTREAM_ORIGIN": "https://your-tunnel.trycloudflare.com"
+  }
+}

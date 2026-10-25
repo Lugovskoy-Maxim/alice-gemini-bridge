@@ -1,0 +1,2 @@
+# Current public URL of the running laptop tunnel. Replace when Quick Tunnel changes.
+UPSTREAM_ORIGIN=https://your-tunnel.trycloudflare.com
