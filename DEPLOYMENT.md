@@ -13,7 +13,34 @@ docker --version
 docker compose version
 ```
 
-Откройте на VPS и у хостинг-провайдера входящие TCP-порты `80` и `443`. Порт `8787` наружу не открывайте. Compose публикует его только на loopback. Docker предупреждает, что опубликованные контейнерные порты могут обходить UFW, поэтому здесь привязка к `127.0.0.1`. [Docker: Docker и ufw](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
+### Какие порты открыть
+
+На VPS и в сетевом экране хостера разрешите входящие:
+
+| Протокол/порт | Для чего | Доступ |
+| --- | --- | --- |
+| TCP 22 | SSH для администрирования | Лучше ограничить своим IP, если у него постоянный адрес |
+| TCP 80 | HTTP и проверка домена для TLS-сертификата | Из интернета |
+| TCP 443 | HTTPS webhook Алисы | Из интернета |
+
+Не открывайте TCP `8787`: это внутренний порт приложения и панели, опубликованный Docker только на `127.0.0.1`. Не открывайте входящий UDP-порт WireGuard на VPS: в этой схеме VPS сам подключается как WireGuard-клиент, ему нужно исходящее соединение к VPN endpoint. Если исходящий трафик ограничен политиками VPS, разрешите UDP к IP и порту `Endpoint` из `wg0.conf`.
+
+Для UFW сначала разрешите используемый порт SSH, чтобы не потерять доступ к серверу, затем включите HTTP/HTTPS:
+
+```sh
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw status verbose
+```
+
+Если SSH работает на другом порту, добавьте правило для него вместо `OpenSSH`. Включайте UFW только после проверки правила SSH:
+
+```sh
+sudo ufw enable
+```
+
+Также задайте те же входящие правила в панели VPS/облачного firewall. Docker предупреждает, что опубликованные контейнерные порты могут обходить UFW; этот Compose публикует `8787` только на loopback, не на внешний интерфейс. [Docker: Docker и ufw](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
 
 ## 2. Получите код приложения
 
@@ -74,48 +101,110 @@ sudo ss -ltnp | grep ':8787'
 
 ## 5. Настройте HTTPS webhook через Nginx
 
-Для постоянного адреса проще использовать домен с A-записью на белый IP VPS. Выпустите TLS-сертификат:
+Для постоянного адреса проще использовать домен с A-записью на белый IP VPS. Создайте каталог ACME challenge:
 
 ```sh
-sudo certbot --nginx -d alice.example.ru
+sudo install -d -o www-data -g www-data -m 755 /var/www/letsencrypt/.well-known/acme-challenge
 ```
 
-В HTTPS server-блоке этого домена добавьте проксирование:
+Создайте временный HTTP-сайт `/etc/nginx/sites-available/alice-gemini`:
 
 ```nginx
-location = /alice {
-    return 308 /alice/;
-}
+server {
+    listen 80;
+    server_name alice.example.ru;
 
-location = /alice/ {
-    limit_req zone=alice_webhook burst=20 nodelay;
-    proxy_pass http://127.0.0.1:8787/alice/;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_connect_timeout 1s;
-    proxy_send_timeout 4s;
-    proxy_read_timeout 4s;
-}
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
 
-location / {
-    return 404;
+    location / {
+        return 301 https://$host$request_uri;
+    }
 }
 ```
 
-На уровне `http`, перед server-блоком, задайте лимит:
+Включите сайт и проверьте Nginx:
+
+```sh
+sudo ln -s /etc/nginx/sites-available/alice-gemini /etc/nginx/sites-enabled/alice-gemini
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Когда DNS A-запись домена указывает на VPS и порт 80 доступен снаружи, выпустите сертификат:
+
+```sh
+sudo certbot certonly --webroot -w /var/www/letsencrypt -d alice.example.ru
+```
+
+В `/etc/nginx/conf.d/alice-gemini-rate-limit.conf` задайте зону ограничения частоты (этот файл подключается внутри `http`):
 
 ```nginx
 limit_req_zone $binary_remote_addr zone=alice_webhook:10m rate=120r/m;
 ```
 
-Проверьте и перезагрузите Nginx:
+В HTTPS server-блоке домена укажите сертификат и добавьте проксирование webhook:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name alice.example.ru;
+
+    ssl_certificate     /etc/letsencrypt/live/alice.example.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/alice.example.ru/privkey.pem;
+
+    client_max_body_size 64k;
+
+    # Яндекс обращается только к webhook. Панель наружу не публикуется.
+    location = /alice {
+        return 308 /alice/;
+    }
+
+    location = /alice/ {
+        limit_req zone=alice_webhook burst=20 nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:8787/alice/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_connect_timeout 1s;
+        proxy_send_timeout 4s;
+        proxy_read_timeout 4s;
+    }
+
+    location / {
+        return 404;
+    }
+}
+```
+
+После выпуска сертификата замените временный HTTP server-блок финальным. Оставьте ACME-путь доступным для продления сертификата и перенаправляйте остальной HTTP на HTTPS:
+
+```nginx
+server {
+    listen 80;
+    server_name alice.example.ru;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+```
+
+Проверьте синтаксис и примените настройки:
 
 ```sh
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+Убедитесь, что извне доступны 80/443, webhook отвечает по HTTPS, а панель снаружи возвращает 404. На хосте порт приложения должен слушать только `127.0.0.1:8787`.
 
 В Яндекс Диалогах укажите адрес:
 
