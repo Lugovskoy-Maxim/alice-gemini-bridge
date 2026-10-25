@@ -9,6 +9,9 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.APP_DATA_DIR || path.join(root, 'data');
 const configFile = path.join(dataDir, 'config.json');
 const port = Number(process.env.PORT || 8787);
+const host = process.env.HOST || '127.0.0.1';
+const envApiKey = process.env.GEMINI_API_KEY?.trim() || '';
+const trustedAdminIps = new Set((process.env.ADMIN_TRUSTED_IPS || '').split(',').map((ip) => ip.trim()).filter(Boolean));
 const html = await readFile(path.join(root, 'index.html'));
 await mkdir(dataDir, { recursive: true });
 if (!existsSync(configFile)) await writeFile(configFile, JSON.stringify({ apiKey: '', model: 'gemini-3.5-flash-lite', systemPrompt: 'Ты — дружелюбный и полезный собеседник Алисы. Отвечай по-русски, естественно и кратко. Ответ предназначен для озвучивания: без Markdown, списков и длинных вступлений.', fallback: 'Похоже, я задумалась. Спроси меня ещё раз через секунду.' }, null, 2), { mode: 0o600 });
@@ -19,7 +22,8 @@ const MAX_HISTORY_TURNS = 3;
 const MAX_HISTORY_TEXT = 100;
 function isLocalRequest(req) {
  const address = req.socket.remoteAddress || '';
- return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1' || address === '::ffff:7f00:1';
+ const normalized = address.startsWith('::ffff:') ? address.slice(7) : address;
+ return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1' || address === '::ffff:7f00:1' || trustedAdminIps.has(normalized);
 }
 let tunnelProcess = null;
 let tunnelUrl = '';
@@ -41,11 +45,12 @@ function storedHistory(items) {
  return history;
 }
 async function askGemini(text, history=[]) {
- if (!config.apiKey) throw new Error('Добавьте API-ключ Gemini в настройках.');
+ const apiKey = envApiKey || config.apiKey;
+ if (!apiKey) throw new Error('Добавьте API-ключ Gemini в .env или в настройках.');
  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 3000);
  try {
   const contents=[...history.map((item)=>({role:item.role,parts:[{text:item.text}]})),{role:'user',parts:[{text}]}];
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`, { method:'POST', headers:{'content-type':'application/json','x-goog-api-key':config.apiKey}, body:JSON.stringify({ systemInstruction:{parts:[{text:config.systemPrompt}]}, contents, generationConfig:{temperature:0.5,maxOutputTokens:64,...(config.model.startsWith('gemini-3')?{thinkingConfig:{thinkingLevel:'minimal'}}:{})} }), signal:controller.signal });
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`, { method:'POST', headers:{'content-type':'application/json','x-goog-api-key':apiKey}, body:JSON.stringify({ systemInstruction:{parts:[{text:config.systemPrompt}]}, contents, generationConfig:{temperature:0.5,maxOutputTokens:64,...(config.model.startsWith('gemini-3')?{thinkingConfig:{thinkingLevel:'minimal'}}:{})} }), signal:controller.signal });
   const data = await response.json(); if (!response.ok) throw new Error(data.error?.message || `Gemini вернул HTTP ${response.status}`);
   return data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim() || 'Не получилось сформулировать ответ. Спроси ещё раз.';
  } finally { clearTimeout(timer); }
@@ -57,9 +62,9 @@ const server = http.createServer(async (req,res) => {
  if (isPublicTunnelRequest) { const entry={time:new Date().toISOString(),question:`${req.method} ${url.pathname}`,answer:'Публичный запрос дошёл до сервера',ok:true}; log.unshift(entry); log.splice(50); }
  if ((!isLocalRequest(req) || isPublicTunnelRequest) && !isAlicePath) return json(res,404,{error:'Не найдено'});
  if (req.method==='GET' && url.pathname==='/') { res.writeHead(200,{'content-type':'text/html; charset=utf-8'}); return res.end(html); }
- if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{configured:!!config.apiKey,model:config.model,webhook:`http://localhost:${port}/alice`,requests:log.length,tunnel:{running:!!tunnelProcess,url:tunnelUrl,error:tunnelError}});
+ if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{configured:!!(envApiKey || config.apiKey),apiKeySource:envApiKey?'environment':'settings',model:config.model,webhook:`http://localhost:${port}/alice`,requests:log.length,tunnel:{running:!!tunnelProcess,url:tunnelUrl,error:tunnelError}});
  if (req.method==='GET' && url.pathname==='/api/log') return json(res,200,log);
- if (req.method==='POST' && url.pathname==='/api/config') { try { const input=await body(req); config={...config,apiKey:String(input.apiKey ?? config.apiKey).trim(),model:String(input.model || config.model).trim(),systemPrompt:String(input.systemPrompt || config.systemPrompt).slice(0,4000),fallback:String(input.fallback || config.fallback).slice(0,300)}; await writeFile(configFile,JSON.stringify(config,null,2),{mode:0o600}); await chmod(configFile,0o600); return json(res,200,{ok:true,configured:!!config.apiKey,model:config.model}); } catch(e) { return json(res,400,{error:e.message}); } }
+ if (req.method==='POST' && url.pathname==='/api/config') { try { const input=await body(req); config={...config,apiKey:envApiKey?config.apiKey:String(input.apiKey ?? config.apiKey).trim(),model:String(input.model || config.model).trim(),systemPrompt:String(input.systemPrompt || config.systemPrompt).slice(0,4000),fallback:String(input.fallback || config.fallback).slice(0,300)}; await writeFile(configFile,JSON.stringify(config,null,2),{mode:0o600}); await chmod(configFile,0o600); return json(res,200,{ok:true,configured:!!(envApiKey || config.apiKey),apiKeySource:envApiKey?'environment':'settings',model:config.model}); } catch(e) { return json(res,400,{error:e.message}); } }
  if (req.method==='POST' && url.pathname==='/api/tunnel/start') {
   if (tunnelProcess) return json(res,200,{running:true,url:tunnelUrl});
   const binary = process.env.CLOUDFLARED_PATH || (process.platform === 'darwin' && existsSync('/opt/homebrew/bin/cloudflared') ? '/opt/homebrew/bin/cloudflared' : (process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared'));
@@ -89,4 +94,4 @@ const server = http.createServer(async (req,res) => {
  if (req.method==='OPTIONS') { res.writeHead(204,{'access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'}); return res.end(); }
  json(res,404,{error:'Не найдено'});
 });
-server.listen(port,'127.0.0.1',()=>console.log(`Alice Gemini Bridge: http://localhost:${port}`));
+server.listen(port,host,()=>console.log(`Alice Gemini Bridge: http://${host}:${port}`));

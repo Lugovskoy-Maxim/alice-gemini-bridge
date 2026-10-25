@@ -1,241 +1,158 @@
-# Установка на VPS с Nginx
+# Деплой на VPS: Docker, WireGuard и webhook Алисы
 
-Руководство для Ubuntu/Debian и отдельного VPS с публичным IPv4. Приложение слушает только `127.0.0.1:8787`; наружу Nginx публикует только webhook `/alice/`. Панель и Google API-ключ доступны через SSH-туннель.
+Compose запускает приложение через Gluetun с WireGuard. Исходящие запросы приложения к Gemini идут через VPN. Алиса подключается к публичному HTTPS адресу VPS напрямую через Nginx, без VPN. Nginx проксирует только `/alice/`; приложение и панель привязаны только к `127.0.0.1`.
 
-## 1. Сеть и DNS
+## 1. Установите Docker и Nginx
 
-В панели VPS откройте входящие TCP-порты **80 и 443**. Включите те же порты в `ufw`, если он используется. Порт `8787` наружу не открывайте.
-
-Для обычного сертификата укажите DNS-запись `A` домена на статический IP VPS. Например, `alice.example.ru → 203.0.113.10`. Можно также использовать сертификат непосредственно на IP (инструкция ниже). Если домен использует проксирование Cloudflare, для конфигурации ниже установите DNS only либо отдельно настройте Nginx real-IP для адресов Cloudflare.
-
-## 2. Установите Node.js и Nginx
-
-Установите Nginx, Git и Node.js 20 или новее из подходящего для вашей системы источника:
+Установите Docker Engine с Compose plugin по [официальной инструкции Docker](https://docs.docker.com/engine/install/). Затем установите Nginx и Certbot:
 
 ```sh
 sudo apt update
-sudo apt install -y nginx git
-node --version
+sudo apt install -y nginx certbot python3-certbot-nginx git
+docker --version
+docker compose version
 ```
 
-Если Node.js не установлен или его версия ниже 20, сначала поставьте поддерживаемую версию, затем продолжайте. Приложению не нужны npm-зависимости.
+Откройте на VPS и у хостинг-провайдера входящие TCP-порты `80` и `443`. Порт `8787` наружу не открывайте. Compose публикует его только на loopback. Docker предупреждает, что опубликованные контейнерные порты могут обходить UFW, поэтому здесь привязка к `127.0.0.1`. [Docker: Docker и ufw](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
 
-## 3. Разместите исходники и создайте пользователя службы
+## 2. Получите код приложения
 
-Скопируйте в `/opt/alice-gemini` файлы `server.mjs`, `index.html` и `package.json` из репозитория. Сделать это можно через `git clone` (для закрытого репозитория настройте на VPS read-only SSH deploy key) или через SCP.
+Репозиторий приватный. Настройте SSH-доступ к GitHub на VPS, например read-only deploy key, и скопируйте код:
 
 ```sh
-sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin alicegemini
-sudo install -d -o root -g root -m 755 /opt/alice-gemini
-sudo install -d -o alicegemini -g alicegemini -m 700 /var/lib/alice-gemini
-sudo chown -R root:root /opt/alice-gemini
+sudo mkdir -p /opt/alice-gemini
+sudo chown "$USER":"$USER" /opt/alice-gemini
+git clone git@github.com:Lugovskoy-Maxim/alice-gemini-bridge.git /opt/alice-gemini
+cd /opt/alice-gemini
 ```
 
-Проверьте, что каталог содержит файлы приложения:
+## 3. Положите секреты в файлы
+
+Создайте `.env` для API-ключа и папку для WireGuard-файла:
 
 ```sh
-ls -l /opt/alice-gemini/server.mjs /opt/alice-gemini/index.html /opt/alice-gemini/package.json
+cp .env.example .env
+mkdir -p wireguard
+chmod 700 wireguard
+nano .env
+nano wireguard/wg0.conf
+chmod 600 .env wireguard/wg0.conf
 ```
 
-Создайте `/etc/systemd/system/alice-gemini.service`:
+В `.env` вставьте ключ Google AI Studio:
 
-```ini
-[Unit]
-Description=Alice Gemini webhook
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=alicegemini
-Group=alicegemini
-WorkingDirectory=/opt/alice-gemini
-Environment=PORT=8787
-Environment=APP_DATA_DIR=/var/lib/alice-gemini
-ExecStart=/usr/bin/node /opt/alice-gemini/server.mjs
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/alice-gemini
-
-[Install]
-WantedBy=multi-user.target
+```dotenv
+GEMINI_API_KEY=ваш_ключ_Gemini
+APP_PORT=8787
+DOCKER_SUBNET=172.30.0.0/24
+DOCKER_GATEWAY=172.30.0.1
 ```
 
-Если `node --version` показал, что Node расположен не в `/usr/bin/node`, замените путь в `ExecStart` на результат `command -v node`.
+WireGuard-конфиг храните отдельным файлом `wireguard/wg0.conf`. Скопируйте туда конфиг клиента, который выдал ваш VPN-провайдер, с секциями `[Interface]` и `[Peer]`. Убедитесь, что в `Endpoint` стоит IP-адрес сервера (не DNS-имя), а `AllowedIPs` содержит `0.0.0.0/0`, если весь исходящий трафик приложения должен идти через VPN. Gluetun поддерживает WireGuard-конфиг отдельным файлом; custom WireGuard пока требует IP-адрес endpoint. [WireGuard custom provider](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/custom.md#wireguard)
+
+В Compose настроено `DOCKER_SUBNET=172.30.0.0/24` с шлюзом `172.30.0.1`. Если сеть пересекается с адресами WireGuard, поменяйте оба значения в `.env` на свободную подсеть и её адрес шлюза (обычно первый адрес, `.1`). Compose разрешит приложению обращаться к Docker-шлюзу напрямую, чтобы ответ SSH-туннелю/локальному Nginx не ушёл в VPN. Gemini-запросы продолжат идти через VPN. Gluetun позволяет настраивать разрешённые входящие порты и локальные подсети отдельно. [Публикация портов](https://github.com/qdm12/gluetun-wiki/blob/main/setup/port-mapping.md), [Firewall](https://github.com/qdm12/gluetun-wiki/blob/main/setup/options/firewall.md)
+
+Файлы `.env` и `wireguard/wg0.conf` исключены из Git и Docker build context. Не загружайте их в репозиторий.
+
+## 4. Соберите и запустите
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now alice-gemini
-sudo systemctl status alice-gemini --no-pager
+docker compose up -d --build
+docker compose ps
+docker compose logs -f gluetun alice-gemini
+```
+
+Дождитесь успешного подключения WireGuard в журнале `gluetun`. Приложение запустится после успешного healthcheck VPN-контейнера. Gluetun использует kill switch: если VPN отключится, исходящий трафик приложения блокируется, а не переключается на обычный интернет. Алиса при этом продолжает доходить до webhook через Nginx; Gemini временно может быть недоступен.
+
+Проверьте локальный порт:
+
+```sh
 sudo ss -ltnp | grep ':8787'
 ```
 
-В выводе `ss` должен быть адрес `127.0.0.1:8787`, а не `0.0.0.0:8787`.
+Должен слушать только `127.0.0.1:8787`. Данные панели и системный prompt сохраняются в Docker volume `alice_data`. Gemini key берётся из `.env` и не копируется в volume или образ.
 
-## 4. Подготовьте HTTP для выпуска сертификата
+## 5. Настройте HTTPS webhook через Nginx
 
-Создайте каталог проверки Let's Encrypt:
-
-```sh
-sudo install -d -o www-data -g www-data -m 755 /var/www/letsencrypt/.well-known/acme-challenge
-```
-
-Временно или постоянно установите HTTP-блок Nginx, подставив домен либо IPv4 вместо примера:
-
-```nginx
-server {
-    listen 80;
-    server_name alice.example.ru;
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/letsencrypt;
-    }
-
-    location / {
-        return 404;
-    }
-}
-```
-
-Сохраните его в `/etc/nginx/sites-available/alice-gemini`, включите сайт и проверьте конфигурацию:
+Для постоянного адреса проще использовать домен с A-записью на белый IP VPS. Выпустите TLS-сертификат:
 
 ```sh
-sudo ln -s /etc/nginx/sites-available/alice-gemini /etc/nginx/sites-enabled/alice-gemini
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-### Вариант A: сертификат на домен
-
-Убедитесь, что `alice.example.ru` уже указывает на IP VPS и порт 80 доступен из интернета. Установите Certbot с плагином Nginx и запросите сертификат:
-
-```sh
-sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d alice.example.ru
 ```
 
-Certbot обычно добавляет HTTPS-настройки сам. Затем проверьте блок ниже, оставив нужный `server_name` и пути к сертификату.
-
-### Вариант B: сертификат прямо на статический IPv4
-
-Let's Encrypt выпускает IP-сертификаты с коротким сроком действия около 160 часов. Нужен Certbot 5.4 или новее; его Nginx-плагин пока не устанавливает сертификат на IP автоматически, поэтому Nginx настраивается вручную. Выпуск через `webroot`:
-
-```sh
-sudo certbot --version
-sudo certbot certonly --preferred-profile shortlived \
-  --webroot --webroot-path /var/www/letsencrypt \
-  --ip-address 203.0.113.10
-```
-
-Замените `203.0.113.10` на статический адрес VPS. Путь к файлам будет `/etc/letsencrypt/live/203.0.113.10/fullchain.pem` и `privkey.pem`. Поскольку сертификат живёт около шести дней, обязательно проверьте автоматическое продление:
-
-```sh
-systemctl list-timers | grep -i certbot
-sudo certbot renew --dry-run
-```
-
-Чтобы Nginx перечитывал обновлённый сертификат, добавьте deploy hook:
-
-```sh
-sudo install -d /etc/letsencrypt/renewal-hooks/deploy
-sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx >/dev/null <<'EOF'
-#!/bin/sh
-systemctl reload nginx
-EOF
-sudo chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
-```
-
-## 5. Включите HTTPS webhook в Nginx
-
-Добавьте HTTPS-блок в `/etc/nginx/sites-available/alice-gemini`. Для домена используйте его имя в `server_name` и каталоге сертификата. Для IP поставьте IP в `server_name` и используйте пути из предыдущего раздела.
+В HTTPS server-блоке этого домена добавьте проксирование:
 
 ```nginx
-limit_req_zone $binary_remote_addr zone=alice_webhook:10m rate=120r/m;
+location = /alice {
+    return 308 /alice/;
+}
 
-server {
-    listen 443 ssl;
-    server_name alice.example.ru;
+location = /alice/ {
+    limit_req zone=alice_webhook burst=20 nodelay;
+    proxy_pass http://127.0.0.1:8787/alice/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_connect_timeout 1s;
+    proxy_send_timeout 4s;
+    proxy_read_timeout 4s;
+}
 
-    ssl_certificate     /etc/letsencrypt/live/alice.example.ru/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/alice.example.ru/privkey.pem;
-
-    client_max_body_size 64k;
-
-    location = /alice {
-        return 308 /alice/;
-    }
-
-    location = /alice/ {
-        limit_req zone=alice_webhook burst=20 nodelay;
-        proxy_pass http://127.0.0.1:8787/alice/;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_connect_timeout 1s;
-        proxy_send_timeout 4s;
-        proxy_read_timeout 4s;
-    }
-
-    location / {
-        return 404;
-    }
+location / {
+    return 404;
 }
 ```
 
-В доменном варианте удалите временный HTTP-блок из раздела 4 или замените `location /` в нём на переадресацию к HTTPS, сохранив путь `/.well-known/acme-challenge/` для последующих продлений. Затем проверьте и перечитайте конфигурацию:
+На уровне `http`, перед server-блоком, задайте лимит:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=alice_webhook:10m rate=120r/m;
+```
+
+Проверьте и перезагрузите Nginx:
 
 ```sh
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Webhook приложения отвечает по HTTPS. Яндекс ждёт ответ не дольше 4,5 секунды; приложение ограничивает запрос к Gemini тремя секундами и возвращает запасной текст при таймауте. Источник: [формат ответа Яндекса](https://yandex.ru/dev/dialogs/alice/doc/ru/response).
+В Яндекс Диалогах укажите адрес:
 
-## 6. Секретно внесите Gemini API-ключ
-
-Создайте SSH-туннель со своего компьютера:
-
-```sh
-ssh -N -L 18787:127.0.0.1:8787 USER@203.0.113.10
+```text
+https://alice.example.ru/alice/
 ```
 
-Не закрывая терминал, откройте `http://127.0.0.1:18787`, введите ключ Gemini API в панели приложения и сохраните его. Ключ записывается в `/var/lib/alice-gemini/config.json`, а не в Git. Проверьте права:
+Внешние запросы к Gemini идут через WireGuard внутри контейнера. Входящий webhook Алисы идёт напрямую к Nginx на VPS, HTTPS завершается на Nginx и доходит до приложения через loopback-порт. Это отдельные направления сети.
+
+Если у вас только IP без домена, нужен TLS-сертификат, выданный именно для IP, и соответствующая конфигурация Nginx. Такие IP-сертификаты краткосрочные, поэтому заранее настройте и проверьте автоматическое продление.
+
+## 6. Панель приложения
+
+Панель не доступна публично. Подключайтесь к ней через SSH-туннель со своего компьютера:
 
 ```sh
-sudo stat -c '%a %U:%G %n' /var/lib/alice-gemini/config.json
+ssh -N -L 18787:127.0.0.1:8787 USER@IP_ВАШЕГО_VPS
 ```
 
-Ожидаемые права файла: `600`, владелец `alicegemini`.
+Пока команда работает, откройте `http://127.0.0.1:18787`. В панели можно проверить состояние и изменить системный prompt. API-ключ читается из `.env`; поле ключа в интерфейсе его не показывает и не заменяет.
 
-## 7. Подключите навык
-
-В Яндекс Диалогах в поле Webhook URL укажите один из адресов:
-
-- домен: `https://alice.example.ru/alice/`
-- статический IPv4: `https://203.0.113.10/alice/`
-
-Не указывайте `http://` и не публикуйте порт `8787`. Сохраните черновик и проверьте приветствие, обычный вопрос и повторную реплику в разделе тестирования. Публикацию отправляйте после проверки всех обязательных данных и значка.
-
-## 8. Обновление и журнал
-
-После замены кода перезапустите службу:
+## Обновление и журналы
 
 ```sh
-sudo systemctl restart alice-gemini
-sudo journalctl -u alice-gemini -n 100 --no-pager
+cd /opt/alice-gemini
+git pull
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 gluetun alice-gemini
 ```
 
-При проблемах с TLS:
+Остановить контейнеры, сохранив данные:
 
 ```sh
-sudo nginx -t
-sudo certbot renew --dry-run
-sudo journalctl -u nginx -n 100 --no-pager
+docker compose down
 ```
 
-**Ограничение доступа:** webhook — публичный endpoint и не имеет отдельной авторизации на уровне протокола Яндекс Диалогов. Nginx rate limit ограничивает частоту с одного IP, но не является пользовательской авторизацией. Панель приложения оставляйте за SSH-туннелем, включите бюджетные лимиты Google AI Studio и следите за расходом API.
+Не добавляйте `-v`, если хотите оставить volume с настройками приложения.
+
+Если запуск не удался, сначала проверьте `docker compose logs gluetun`, WireGuard-ключи и IP в `Endpoint`, затем убедитесь, что подсети Docker и WireGuard не пересекаются. Для Nginx выполните `sudo nginx -t` и проверьте сертификат и домен.

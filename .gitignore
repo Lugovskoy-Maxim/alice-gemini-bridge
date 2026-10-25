@@ -1,4 +1,7 @@
 .DS_Store
+.env
+.env.*
+!.env.example
 .npm-cache/
 .wrangler-logs/
 **/node_modules/
@@ -7,6 +10,7 @@ cloudflare-worker/.dev.vars
 cloudflare-worker/.dev.vars.*
 data/
 outputs/
+wireguard/
 *.log
 *.zip
 *.dmg

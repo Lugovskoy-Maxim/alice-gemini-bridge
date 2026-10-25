@@ -1,0 +1,49 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.41.3
+    container_name: alice-gemini-vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: custom
+      VPN_TYPE: wireguard
+      FIREWALL_INPUT_PORTS: "8787"
+      FIREWALL_OUTBOUND_SUBNETS: ${DOCKER_SUBNET:-172.30.0.0/24}
+      TZ: Europe/Moscow
+    volumes:
+      - ./wireguard/wg0.conf:/gluetun/wireguard/wg0.conf:ro
+    ports:
+      - "127.0.0.1:${APP_PORT:-8787}:8787/tcp"
+    networks:
+      - alice_net
+    restart: unless-stopped
+  alice-gemini:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alice-gemini
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      APP_DATA_DIR: /data
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Add GEMINI_API_KEY to .env}
+      ADMIN_TRUSTED_IPS: ${DOCKER_GATEWAY:-172.30.0.1}
+    volumes:
+      - alice_data:/data
+    restart: unless-stopped
+
+volumes:
+  alice_data:
+
+networks:
+  alice_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${DOCKER_SUBNET:-172.30.0.0/24}

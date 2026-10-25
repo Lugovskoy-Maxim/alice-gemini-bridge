@@ -1,6 +1,15 @@
 # Алиса × Gemini
 
-Локальный webhook-сервер для навыка Алисы в Яндекс Диалогах. Принимает запросы Яндекса и отвечает через Gemini API. Панель настройки и Google API-ключ остаются на сервере приложения.
+Webhook-сервер для навыка Алисы в Яндекс Диалогах. Принимает запросы Яндекса и отвечает через Gemini API. Для VPS есть Docker Compose с WireGuard: исходящие запросы Gemini идут через VPN, входящий HTTPS webhook Алисы приходит напрямую через Nginx.
+
+## VPS: Docker + WireGuard
+
+1. Установите Docker Engine с Compose plugin. Подробная настройка VPS, HTTPS и Nginx находится в [DEPLOYMENT.md](DEPLOYMENT.md).
+2. Скопируйте `.env.example` в `.env` и вставьте `GEMINI_API_KEY`.
+3. Создайте `wireguard/wg0.conf` с клиентским конфигом WireGuard от вашего VPN-провайдера.
+4. Выполните `docker compose up -d --build`.
+
+Compose публикует порт приложения только на `127.0.0.1` сервера. Nginx отдаёт наружу только `/alice/`; панель остаётся доступна через SSH-туннель. VPN-конфиг и `.env` исключены из Git. Контейнер приложения использует сетевой стек Gluetun и его kill switch.
 
 ## Быстрый запуск на macOS или Linux
 
